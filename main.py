@@ -127,6 +127,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from IPython.display import HTML
+from torch.nn import Parameter
+from torch.nn import init
 
 # Set random seed for reproducibility
 manualSeed = 999
@@ -284,13 +286,99 @@ plt.imshow(np.transpose(vutils.make_grid(real_batch[0].to(device)[:64], padding=
 #
 
 # custom weights initialization called on netG and netD
+# def weights_init(m):
+#     classname = m.__class__.__name__
+#     if classname.find('Conv') != -1:
+#         nn.init.normal_(m.weight.data, 0.0, 0.02)
+#     elif classname.find('BatchNorm') != -1:
+#         nn.init.normal_(m.weight.data, 1.0, 0.02)
+#         nn.init.constant_(m.bias.data, 0)
+
 def weights_init(m):
     classname = m.__class__.__name__
-    if classname.find('Conv') != -1:
-        nn.init.normal_(m.weight.data, 0.0, 0.02)
-    elif classname.find('BatchNorm') != -1:
-        nn.init.normal_(m.weight.data, 1.0, 0.02)
-        nn.init.constant_(m.bias.data, 0)
+    if classname.find('Conv') != -1:  # and hasattr(m, 'weight'):
+        init.normal_(m.weight.data, 0.0, 0.02)  # 正态分布初始化
+    elif classname.find('Linear') != -1 and hasattr(m, 'weight'):
+        init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm2d') != -1:
+        init.normal_(m.weight.data, 1.0, 0.02)
+        init.constant(m.bias.data, 0.0)
+
+
+######################################################################
+# 谱归一化
+
+
+def l2normalize(v, eps=1e-12):
+    return v / (v.norm() + eps)
+
+
+class SpectralNorm(nn.Module):
+    def __init__(self, module, name='weight', power_iterations=10):
+        super(SpectralNorm, self).__init__()
+        self.module = module
+        self.name = name
+        self.power_iterations = power_iterations
+        if not self._made_params():
+            self._make_params()
+
+    def _update_u_v(self):
+        u = getattr(self.module, self.name + "_u")  # 获取对象属性值：weight_u
+        v = getattr(self.module, self.name + "_v")  # weight_v
+        w = getattr(self.module, self.name + "_bar")  # weight_bar已经等价与weight
+
+        # print('u.shape:', u.shape)>>u.shape: torch.Size([16])
+        # print('v.shape:', v.shape)>>v.shape: torch.Size([48])
+        # print('w.shape:', w.shape)>>torch.Size([16, 3, 4, 4])
+        height = w.data.shape[0]
+        # print('w.height:', height)>>16
+        for _ in range(self.power_iterations):
+            v.data = l2normalize(torch.mv(torch.t(w.view(height, -1).data), u.data))  # w^T*u/|| w^T*u ||
+            u.data = l2normalize(torch.mv(w.view(height, -1).data, v.data))  # w*v/|| w*v ||
+
+        # print('v.shape:', v.shape)>>torch.Size([48])
+        # print('u.shape:', u.shape)>>torch.Size([16])
+        # sigma = torch.dot(u.data, torch.mv(w.view(height,-1).data, v.data))
+        sigma = u.dot(w.view(height, -1).mv(v))  # || w ||_2=u^T*w*v
+        # print('w.view(height,-1).shape:', w.view(height, -1).shape)>>torch.Size([16, 48])
+        # print('w.view(height,-1).mv(v).shape:', w.view(height, -1).mv(v).shape)>>torch.Size([16])
+        # print('sigma:', sigma)  # 返回矩阵谱范数,标量
+        # w / sigma.expand_as(w) 谱范数归一化
+        setattr(self.module, self.name, Parameter(w / sigma.expand_as(w)))  # 对weight重新赋值
+
+    def _made_params(self):
+        try:
+            u = getattr(self.module, self.name + "_u")
+            v = getattr(self.module, self.name + "_v")
+            w = getattr(self.module, self.name + "_bar")
+            return True
+        except AttributeError:  # 返回false,执行_make_params，创建weight_u，weight_v，weight_bar
+            return False
+
+    def _make_params(self):
+        w = getattr(self.module, self.name)  # 获取weight
+
+        height = w.data.shape[0]
+        width = w.view(height, -1).data.shape[1]
+
+        u = nn.Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)  # 初始化u,v
+        v = nn.Parameter(w.data.new(width).normal_(0, 1), requires_grad=False)
+        u.data = l2normalize(u.data)  # 对u,v进行归一化
+        v.data = l2normalize(v.data)
+        w_bar = Parameter(w.data)  #
+
+        # del self.module._parameters[self.name]#注意此处删除了weight
+
+        self.module.register_parameter(self.name + "_u", u)  # 为module创建weight_u，weight_v，weight_bar
+        self.module.register_parameter(self.name + "_v", v)
+        self.module.register_parameter(self.name + "_bar", w_bar)
+
+    def forward(self, *args):
+        self._update_u_v()
+        return self.module.forward(*args)
+
+
+######################################################################
 
 
 ######################################################################
@@ -321,6 +409,7 @@ def weights_init(m):
 # code for the generator.
 #
 
+
 # Generator Code
 
 class Generator(nn.Module):
@@ -329,23 +418,23 @@ class Generator(nn.Module):
         self.ngpu = ngpu
         self.main = nn.Sequential(
             # input is Z, going into a convolution
-            nn.ConvTranspose2d(nz, ngf * 8, 4, 1, 0, bias=False),
+            SpectralNorm(nn.ConvTranspose2d(nz, ngf * 8, 4, 1, 0, bias=False)),
             nn.BatchNorm2d(ngf * 8),
             nn.ReLU(True),
             # state size. (ngf*8) x 4 x 4
-            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
+            SpectralNorm(nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ngf * 4),
             nn.ReLU(True),
             # state size. (ngf*4) x 8 x 8
-            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+            SpectralNorm(nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ngf * 2),
             nn.ReLU(True),
             # state size. (ngf*2) x 16 x 16
-            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),
+            SpectralNorm(nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ngf),
             nn.ReLU(True),
             # state size. (ngf) x 32 x 32
-            nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
+            SpectralNorm(nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False)),
             nn.Tanh()
             # state size. (nc) x 64 x 64
         )
@@ -403,22 +492,22 @@ class Discriminator(nn.Module):
         self.ngpu = ngpu
         self.main = nn.Sequential(
             # input is (nc) x 64 x 64
-            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
+            SpectralNorm(nn.Conv2d(nc, ndf, 4, 2, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf) x 32 x 32
-            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+            SpectralNorm(nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ndf * 2),
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf*2) x 16 x 16
-            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+            SpectralNorm(nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ndf * 4),
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf*4) x 8 x 8
-            nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+            SpectralNorm(nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ndf * 8),
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf*8) x 4 x 4
-            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
+            SpectralNorm(nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False)),
             nn.Sigmoid()
         )
 
@@ -490,8 +579,12 @@ real_label = 1.
 fake_label = 0.
 
 # Setup Adam optimizers for both G and D
-optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, 0.999))
-optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, 0.999))
+# because the spectral normalization module creates parameters that don't require gradients (u and v), we don't want to
+# optimize these using sgd. We only let the optimizer operate on parameters that _do_ require gradients
+optimizerD = optim.Adam(filter(lambda d: d.requires_grad, netD.parameters()), lr=lr, betas=(beta1, 0.9))
+optimizerG = optim.Adam(filter(lambda g: g.requires_grad, netG.parameters()), lr=lr, betas=(beta1, 0.9))
+# optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, 0.999))
+# optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, 0.999))
 
 ######################################################################
 # Training
