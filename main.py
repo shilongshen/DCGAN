@@ -129,9 +129,11 @@ import matplotlib.animation as animation
 from IPython.display import HTML
 from torch.nn import Parameter
 from torch.nn import init
+import torch.nn.functional as F
+from torch.nn.utils.spectral_norm import spectral_norm
 
 # Set random seed for reproducibility
-manualSeed = 999
+manualSeed = 100
 # manualSeed = random.randint(1, 10000) # use if you want new results
 print("Random Seed: ", manualSeed)
 random.seed(manualSeed)
@@ -180,7 +182,7 @@ dataroot = "/home/wag/ssl/datasets/celeba"
 workers = 8
 
 # Batch size during training
-batch_size = 128
+batch_size = 1024
 
 # Spatial size of training images. All images will be resized to this
 #   size using a transformer.
@@ -190,7 +192,7 @@ image_size = 64
 nc = 3
 
 # Size of z latent vector (i.e. size of generator input)
-nz = 100
+nz = 20
 
 # Size of feature maps in generator
 ngf = 64
@@ -199,7 +201,7 @@ ngf = 64
 ndf = 64
 
 # Number of training epochs
-num_epochs = 100
+num_epochs = 50
 
 # Learning rate for optimizers
 lr = 0.0002
@@ -296,89 +298,14 @@ plt.imshow(np.transpose(vutils.make_grid(real_batch[0].to(device)[:64], padding=
 
 def weights_init(m):
     classname = m.__class__.__name__
-    if classname.find('Conv') != -1:  # and hasattr(m, 'weight'):
+    if classname.find('Conv') != -1:
         init.normal_(m.weight.data, 0.0, 0.02)  # 正态分布初始化
-    elif classname.find('Linear') != -1 and hasattr(m, 'weight'):
+    elif classname.find('Linear') != -1:
         init.normal_(m.weight.data, 0.0, 0.02)
     elif classname.find('BatchNorm2d') != -1:
         init.normal_(m.weight.data, 1.0, 0.02)
         init.constant(m.bias.data, 0.0)
 
-
-######################################################################
-# 谱归一化
-
-
-def l2normalize(v, eps=1e-12):
-    return v / (v.norm() + eps)
-
-
-class SpectralNorm(nn.Module):
-    def __init__(self, module, name='weight', power_iterations=10):
-        super(SpectralNorm, self).__init__()
-        self.module = module
-        self.name = name
-        self.power_iterations = power_iterations
-        if not self._made_params():
-            self._make_params()
-
-    def _update_u_v(self):
-        u = getattr(self.module, self.name + "_u")  # 获取对象属性值：weight_u
-        v = getattr(self.module, self.name + "_v")  # weight_v
-        w = getattr(self.module, self.name + "_bar")  # weight_bar已经等价与weight
-
-        # print('u.shape:', u.shape)>>u.shape: torch.Size([16])
-        # print('v.shape:', v.shape)>>v.shape: torch.Size([48])
-        # print('w.shape:', w.shape)>>torch.Size([16, 3, 4, 4])
-        height = w.data.shape[0]
-        # print('w.height:', height)>>16
-        for _ in range(self.power_iterations):
-            v.data = l2normalize(torch.mv(torch.t(w.view(height, -1).data), u.data))  # w^T*u/|| w^T*u ||
-            u.data = l2normalize(torch.mv(w.view(height, -1).data, v.data))  # w*v/|| w*v ||
-
-        # print('v.shape:', v.shape)>>torch.Size([48])
-        # print('u.shape:', u.shape)>>torch.Size([16])
-        # sigma = torch.dot(u.data, torch.mv(w.view(height,-1).data, v.data))
-        sigma = u.dot(w.view(height, -1).mv(v))  # || w ||_2=u^T*w*v
-        # print('w.view(height,-1).shape:', w.view(height, -1).shape)>>torch.Size([16, 48])
-        # print('w.view(height,-1).mv(v).shape:', w.view(height, -1).mv(v).shape)>>torch.Size([16])
-        # print('sigma:', sigma)  # 返回矩阵谱范数,标量
-        # w / sigma.expand_as(w) 谱范数归一化
-        setattr(self.module, self.name, Parameter(w / sigma.expand_as(w)))  # 对weight重新赋值
-
-    def _made_params(self):
-        try:
-            u = getattr(self.module, self.name + "_u")
-            v = getattr(self.module, self.name + "_v")
-            w = getattr(self.module, self.name + "_bar")
-            return True
-        except AttributeError:  # 返回false,执行_make_params，创建weight_u，weight_v，weight_bar
-            return False
-
-    def _make_params(self):
-        w = getattr(self.module, self.name)  # 获取weight
-
-        height = w.data.shape[0]
-        width = w.view(height, -1).data.shape[1]
-
-        u = nn.Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)  # 初始化u,v
-        v = nn.Parameter(w.data.new(width).normal_(0, 1), requires_grad=False)
-        u.data = l2normalize(u.data)  # 对u,v进行归一化
-        v.data = l2normalize(v.data)
-        w_bar = Parameter(w.data)  #
-
-        # del self.module._parameters[self.name]#注意此处删除了weight
-
-        self.module.register_parameter(self.name + "_u", u)  # 为module创建weight_u，weight_v，weight_bar
-        self.module.register_parameter(self.name + "_v", v)
-        self.module.register_parameter(self.name + "_bar", w_bar)
-
-    def forward(self, *args):
-        self._update_u_v()
-        return self.module.forward(*args)
-
-
-######################################################################
 
 
 ######################################################################
@@ -418,23 +345,23 @@ class Generator(nn.Module):
         self.ngpu = ngpu
         self.main = nn.Sequential(
             # input is Z, going into a convolution
-            SpectralNorm(nn.ConvTranspose2d(nz, ngf * 8, 4, 1, 0, bias=False)),
+            spectral_norm(nn.ConvTranspose2d(nz, ngf * 8, 4, 1, 0, bias=False)),
             nn.BatchNorm2d(ngf * 8),
             nn.ReLU(True),
             # state size. (ngf*8) x 4 x 4
-            SpectralNorm(nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False)),
+            spectral_norm(nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ngf * 4),
             nn.ReLU(True),
             # state size. (ngf*4) x 8 x 8
-            SpectralNorm(nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False)),
+            spectral_norm(nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ngf * 2),
             nn.ReLU(True),
             # state size. (ngf*2) x 16 x 16
-            SpectralNorm(nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False)),
+            spectral_norm(nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ngf),
             nn.ReLU(True),
             # state size. (ngf) x 32 x 32
-            SpectralNorm(nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False)),
+            spectral_norm(nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False)),
             nn.Tanh()
             # state size. (nc) x 64 x 64
         )
@@ -458,6 +385,7 @@ if (device.type == 'cuda') and (ngpu > 1):
 
 # Apply the weights_init function to randomly initialize all weights
 #  to mean=0, stdev=0.2.
+
 netG.apply(weights_init)
 
 # Print the model
@@ -492,22 +420,22 @@ class Discriminator(nn.Module):
         self.ngpu = ngpu
         self.main = nn.Sequential(
             # input is (nc) x 64 x 64
-            SpectralNorm(nn.Conv2d(nc, ndf, 4, 2, 1, bias=False)),
+            spectral_norm(nn.Conv2d(nc, ndf, 4, 2, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf) x 32 x 32
-            SpectralNorm(nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False)),
+            spectral_norm(nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ndf * 2),
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf*2) x 16 x 16
-            SpectralNorm(nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False)),
+            spectral_norm(nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ndf * 4),
             nn.LeakyReLU(0.2, inplace=True),
             # state size. (ndf*4) x 8 x 8
-            SpectralNorm(nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False)),
+            spectral_norm(nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False)),
             nn.BatchNorm2d(ndf * 8),
             nn.LeakyReLU(0.2, inplace=True),
-            # state size. (ndf*8) x 4 x 4
-            SpectralNorm(nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False)),
+            # state size. (ndf*8) x 4 x4
+            spectral_norm(nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False)),
             nn.Sigmoid()
         )
 
@@ -581,10 +509,10 @@ fake_label = 0.
 # Setup Adam optimizers for both G and D
 # because the spectral normalization module creates parameters that don't require gradients (u and v), we don't want to
 # optimize these using sgd. We only let the optimizer operate on parameters that _do_ require gradients
-optimizerD = optim.Adam(filter(lambda d: d.requires_grad, netD.parameters()), lr=lr, betas=(beta1, 0.9))
-optimizerG = optim.Adam(filter(lambda g: g.requires_grad, netG.parameters()), lr=lr, betas=(beta1, 0.9))
-# optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, 0.999))
-# optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, 0.999))
+# optimizerD = optim.Adam(filter(lambda d: d.requires_grad, netD.parameters()), lr=lr, betas=(beta1, 0.9))
+# optimizerG = optim.Adam(filter(lambda g: g.requires_grad, netG.parameters()), lr=lr, betas=(beta1, 0.9))
+optimizerD = optim.Adam(netD.parameters(), lr=0.0004, betas=(beta1, 0.999))
+optimizerG = optim.Adam(netG.parameters(), lr=0.0001, betas=(beta1, 0.999))
 
 ######################################################################
 # Training
@@ -659,6 +587,7 @@ optimizerG = optim.Adam(filter(lambda g: g.requires_grad, netG.parameters()), lr
 # Lists to keep track of progress
 img_list = []
 G_losses = []
+G_losses_l1 = []
 D_losses = []
 iters = 0
 
@@ -707,12 +636,16 @@ for epoch in range(num_epochs):
         # (2) Update G network: maximize log(D(G(z)))
         ###########################
         netG.zero_grad()
+        # errG_l1 = F.smooth_l1_loss(fake, real_cpu)
+
         label.fill_(real_label)  # fake labels are real for generator cost
         # Since we just updated D, perform another forward pass of all-fake batch through D
         output = netD(fake).view(-1)
         # Calculate G's loss based on this output
         errG = criterion(output, label)
         # Calculate gradients for G
+        # errG_total = 1 * errG_l1 + 1 * errG
+        # errG_total.backward()
         errG.backward()
         D_G_z2 = output.mean().item()
         # Update G
@@ -725,6 +658,7 @@ for epoch in range(num_epochs):
                      errD.item(), errG.item(), D_x, D_G_z1, D_G_z2))
 
         # Save Losses for plotting later
+        # G_losses_l1.append(errG_l1.item())
         G_losses.append(errG.item())
         D_losses.append(errD.item())
 
@@ -754,6 +688,7 @@ for epoch in range(num_epochs):
 plt.figure(figsize=(10, 5))
 plt.title("Generator and Discriminator Loss During Training")
 plt.plot(G_losses, label="G")
+# plt.plot(G_losses_l1, label="G_L1")
 plt.plot(D_losses, label="D")
 plt.xlabel("iterations")
 plt.ylabel("Loss")
